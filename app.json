@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "3D Viewer",
+    "slug": "project-3d-viewer",
+    "version": "1.0.0",
+    "orientation": "default",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#101418",
+    "splash": {
+      "backgroundColor": "#101418",
+      "resizeMode": "contain"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.diego.project3dviewer"
+    },
+    "android": {
+      "package": "com.diego.project3dviewer"
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}

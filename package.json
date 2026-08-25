@@ -1,0 +1,32 @@
+{
+  "name": "project-3d-viewer",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web",
+    "prebuild:android": "expo prebuild -p android --no-install",
+    "apk": "expo prebuild -p android --no-install && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.8.10",
+    "expo": "~51.0.28",
+    "expo-asset": "~10.0.10",
+    "expo-document-picker": "~12.0.2",
+    "expo-file-system": "~17.0.1",
+    "expo-gl": "~14.0.2",
+    "expo-status-bar": "~1.12.1",
+    "expo-three": "^8.0.0",
+    "fflate": "^0.8.2",
+    "react": "18.2.0",
+    "react-native": "0.74.5",
+    "text-encoding": "^0.7.0",
+    "three": "^0.166.1"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.24.0"
+  },
+  "private": true
+}
