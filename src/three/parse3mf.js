@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { unzipSync, strFromU8 } from 'fflate';
 
 import { BAMBU_PALETTE } from './bambuColors.js';
+import { bytesToText } from './base64';
 
 // A small, fast, self-contained 3MF parser.
 //
@@ -55,18 +56,52 @@ function parseMatrix(str) {
 }
 
 const OBJECT_OPEN_RE = /<object\b([^>]*)>/g;
-const VERTEX_RE = /<vertex\b[^>]*?\bx="([^"]*)"[^>]*?\by="([^"]*)"[^>]*?\bz="([^"]*)"/g;
-const TRIANGLE_RE = /<triangle\b[^>]*?\bv1="([^"]*)"[^>]*?\bv2="([^"]*)"[^>]*?\bv3="([^"]*)"/g;
-// Colored variant also captures the trailing attributes (pid/p1.. or paint_color).
-const TRIANGLE_COLOR_RE = /<triangle\b[^>]*?\bv1="([^"]*)"[^>]*?\bv2="([^"]*)"[^>]*?\bv3="([^"]*)"([^>]*?)\/?>/g;
 const COMPONENT_RE = /<component\b([^>]*?)\/?>/g;
 const ITEM_RE = /<item\b([^>]*?)\/?>/g;
-// Precompiled hot-path attribute readers for the per-triangle color scan.
-const RE_PAINT = /paint_color="([^"]*)"/;
-const RE_PID = /\bpid="([^"]*)"/;
-const RE_P1 = /\bp1="([^"]*)"/;
-const RE_P2 = /\bp2="([^"]*)"/;
-const RE_P3 = /\bp3="([^"]*)"/;
+
+// Regex-free scanning for the per-vertex/per-triangle hot loops. A printable
+// mesh has hundreds of thousands of these elements; Hermes' backtracking regex
+// engine parses them agonizingly slowly (a 22 MB colored 3MF took ~166 s),
+// whereas native String.indexOf is orders of magnitude faster.
+
+// Find the next occurrence of `tag` (e.g. '<vertex') whose following character
+// is a tag delimiter — so '<triangle' won't match inside '<triangles>'.
+function findTag(text, tag, from, end) {
+  let i = text.indexOf(tag, from);
+  while (i !== -1 && i < end) {
+    const after = text.charCodeAt(i + tag.length);
+    // space, tab, \n, \r, '/', '>'
+    if (after === 32 || after === 9 || after === 10 || after === 13 || after === 47 || after === 62) {
+      return i;
+    }
+    i = text.indexOf(tag, i + tag.length);
+  }
+  return -1;
+}
+
+// Read the quoted value of attribute `key` (e.g. ' x="') from a single tag's
+// text. `tag` must be just the one element (sliced from the document) — never
+// the whole document: String.indexOf has no end bound, so searching a 17 MB
+// string for an attribute that's absent scans to EOF, which turns the per-
+// element loops into O(n²) and hangs on large meshes.
+function attrIn(tag, key) {
+  const i = tag.indexOf(key);
+  if (i === -1) return null;
+  const s = i + key.length;
+  const e = tag.indexOf('"', s);
+  return e === -1 ? null : tag.slice(s, e);
+}
+
+// Count occurrences of `tag` in text[start,end). Used to size typed arrays up
+// front so geometry is filled directly into them — no giant intermediate JS
+// arrays (which balloon memory and GC time on million-triangle meshes).
+function countTag(text, tag, start, end) {
+  let n = 0;
+  for (let i = findTag(text, tag, start, end); i !== -1; i = findTag(text, tag, i + tag.length, end)) {
+    n++;
+  }
+  return n;
+}
 
 function regionHasColor(text, start, end) {
   const has = (needle) => {
@@ -103,20 +138,35 @@ function paintColorInt(code, palette, cache) {
  * Build a plain (uncolored) BufferGeometry from text[start,end).
  */
 function buildGeometryPlain(text, start, end) {
-  const posArr = [];
-  VERTEX_RE.lastIndex = start;
-  let m;
-  while ((m = VERTEX_RE.exec(text)) && m.index < end) posArr.push(+m[1], +m[2], +m[3]);
-  if (!posArr.length) return null;
+  const vCount = countTag(text, '<vertex', start, end);
+  const tCount = countTag(text, '<triangle', start, end);
+  if (!vCount || !tCount) return null;
 
-  const idxArr = [];
-  TRIANGLE_RE.lastIndex = start;
-  while ((m = TRIANGLE_RE.exec(text)) && m.index < end) idxArr.push(+m[1], +m[2], +m[3]);
-  if (!idxArr.length) return null;
+  const positions = new Float32Array(vCount * 3);
+  let p = 0;
+  for (let vi = findTag(text, '<vertex', start, end); vi !== -1; ) {
+    const tagEnd = text.indexOf('>', vi);
+    const tag = text.slice(vi, tagEnd);
+    positions[p++] = +attrIn(tag, ' x="');
+    positions[p++] = +attrIn(tag, ' y="');
+    positions[p++] = +attrIn(tag, ' z="');
+    vi = findTag(text, '<vertex', tagEnd + 1, end);
+  }
+
+  const index = new Uint32Array(tCount * 3);
+  let q = 0;
+  for (let ti = findTag(text, '<triangle', start, end); ti !== -1; ) {
+    const tagEnd = text.indexOf('>', ti);
+    const tag = text.slice(ti, tagEnd);
+    index[q++] = +attrIn(tag, ' v1="');
+    index[q++] = +attrIn(tag, ' v2="');
+    index[q++] = +attrIn(tag, ' v3="');
+    ti = findTag(text, '<triangle', tagEnd + 1, end);
+  }
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(posArr), 3));
-  geometry.setIndex(new THREE.BufferAttribute(Uint32Array.from(idxArr), 1));
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setIndex(new THREE.BufferAttribute(index, 1));
   geometry.computeVertexNormals();
   return geometry;
 }
@@ -127,11 +177,20 @@ function buildGeometryPlain(text, start, end) {
  * region boundaries (keeps the geometry indexed — no vertex explosion).
  */
 function buildGeometryColored(text, start, end, ctx) {
-  const posArr = [];
-  VERTEX_RE.lastIndex = start;
-  let m;
-  while ((m = VERTEX_RE.exec(text)) && m.index < end) posArr.push(+m[1], +m[2], +m[3]);
-  if (!posArr.length) return null;
+  const vCount = countTag(text, '<vertex', start, end);
+  const tCount = countTag(text, '<triangle', start, end);
+  if (!vCount || !tCount) return null;
+
+  const positions = new Float32Array(vCount * 3);
+  let p = 0;
+  for (let vi = findTag(text, '<vertex', start, end); vi !== -1; ) {
+    const tagEnd = text.indexOf('>', vi);
+    const tag = text.slice(vi, tagEnd);
+    positions[p++] = +attrIn(tag, ' x="');
+    positions[p++] = +attrIn(tag, ' y="');
+    positions[p++] = +attrIn(tag, ' z="');
+    vi = findTag(text, '<vertex', tagEnd + 1, end);
+  }
 
   const { groups, palette, objectPid, objectPindex, defaultFill } = ctx;
 
@@ -143,47 +202,49 @@ function buildGeometryColored(text, start, end, ctx) {
   const fg = ((fill >> 8) & 255) / 255;
   const fb = (fill & 255) / 255;
 
-  const vertCount = posArr.length / 3;
-  const colors = new Float32Array(vertCount * 3);
-  for (let i = 0; i < vertCount; i++) {
+  const colors = new Float32Array(vCount * 3);
+  for (let i = 0; i < vCount; i++) {
     colors[i * 3] = fr;
     colors[i * 3 + 1] = fg;
     colors[i * 3 + 2] = fb;
   }
-  const idxArr = [];
+  const index = new Uint32Array(tCount * 3);
+  let q = 0;
   const paintCache = new Map();
   const objDefault =
     objectPid != null && objectPindex != null && groups.get(objectPid)
       ? groups.get(objectPid)[+objectPindex]
       : null;
 
-  TRIANGLE_COLOR_RE.lastIndex = start;
-  while ((m = TRIANGLE_COLOR_RE.exec(text)) && m.index < end) {
-    const a = +m[1];
-    const b = +m[2];
-    const c = +m[3];
-    idxArr.push(a, b, c);
+  for (let ti = findTag(text, '<triangle', start, end); ti !== -1; ) {
+    const tagEnd = text.indexOf('>', ti);
+    const tag = text.slice(ti, tagEnd);
+    const a = +attrIn(tag, ' v1="');
+    const b = +attrIn(tag, ' v2="');
+    const c = +attrIn(tag, ' v3="');
+    index[q++] = a;
+    index[q++] = b;
+    index[q++] = c;
 
-    const extra = m[4];
     let c1 = null;
     let c2 = null;
     let c3 = null;
 
-    const paint = extra.length ? extra.match(RE_PAINT) : null;
-    if (paint) {
-      const col = paintColorInt(paint[1], palette, paintCache);
+    const paint = attrIn(tag, 'paint_color="');
+    if (paint !== null) {
+      const col = paintColorInt(paint, palette, paintCache);
       c1 = c2 = c3 = col;
-    } else if (extra.length) {
-      const p1 = extra.match(RE_P1);
-      if (p1) {
-        const pid = extra.match(RE_PID);
-        const grp = groups.get(pid ? pid[1] : objectPid);
+    } else {
+      const p1 = attrIn(tag, ' p1="');
+      if (p1 !== null) {
+        const pid = attrIn(tag, ' pid="');
+        const grp = groups.get(pid !== null ? pid : objectPid);
         if (grp) {
-          const p2 = extra.match(RE_P2);
-          const p3 = extra.match(RE_P3);
-          c1 = grp[+p1[1]];
-          c2 = grp[+(p2 ? p2[1] : p1[1])];
-          c3 = grp[+(p3 ? p3[1] : p1[1])];
+          const p2 = attrIn(tag, ' p2="');
+          const p3 = attrIn(tag, ' p3="');
+          c1 = grp[+p1];
+          c2 = grp[+(p2 !== null ? p2 : p1)];
+          c3 = grp[+(p3 !== null ? p3 : p1)];
         }
       }
     }
@@ -193,13 +254,14 @@ function buildGeometryColored(text, start, end, ctx) {
     if (c1 != null) writeColor(colors, a, c1);
     if (c2 != null) writeColor(colors, b, c2);
     if (c3 != null) writeColor(colors, c, c3);
+
+    ti = findTag(text, '<triangle', tagEnd + 1, end);
   }
-  if (!idxArr.length) return null;
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(posArr), 3));
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geometry.setIndex(new THREE.BufferAttribute(Uint32Array.from(idxArr), 1));
+  geometry.setIndex(new THREE.BufferAttribute(index, 1));
   geometry.computeVertexNormals();
   return geometry;
 }
@@ -209,7 +271,9 @@ class Archive {
     this.texts = {};
     for (const name of Object.keys(files)) {
       const key = normPath(name);
-      if (key.endsWith('.model')) this.texts[key] = strFromU8(files[name]);
+      // bytesToText (not fflate's strFromU8) — the latter routes through the slow
+      // pure-JS TextDecoder polyfill, which dominates parse time on large models.
+      if (key.endsWith('.model')) this.texts[key] = bytesToText(files[name]);
     }
     this.palette = palette;
     this.parsed = new Map(); // partKey -> Map<id, { geometry, components }>
