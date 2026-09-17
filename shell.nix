@@ -18,9 +18,14 @@
 }:
 
 let
-  # Pin android-nixpkgs. Bump this rev to update the available SDK component set.
+  # Pinned android-nixpkgs revision for reproducible builds. An unpinned branch
+  # HEAD drifts, changing the SDK's Nix store paths and invalidating the cached
+  # native build (node_modules/*/android/.cxx holds absolute paths), which breaks
+  # expo-gl's CMake step. To update: bump `rev`, then refresh `sha256` with
+  #   nix-prefetch-url --unpack https://github.com/tadfisher/android-nixpkgs/archive/<rev>.tar.gz
   android-nixpkgs = import (builtins.fetchTarball {
-    url = "https://github.com/tadfisher/android-nixpkgs/archive/refs/heads/main.tar.gz";
+    url = "https://github.com/tadfisher/android-nixpkgs/archive/2eebcc6db1d9cc81562c5ded6bf4a53f94eca579.tar.gz";
+    sha256 = "0xhky51klbqdl1fgyl3zdr7j6hnggd8wb7jf5pljlwk1vvnc2m16";
   }) { inherit pkgs; channel = "stable"; };
 
   android-sdk = android-nixpkgs.sdk (sdkPkgs: with sdkPkgs; [
