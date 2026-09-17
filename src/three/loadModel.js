@@ -110,6 +110,28 @@ function normalize(object) {
   return { pivot, scale };
 }
 
+/**
+ * Read a file as base64. expo-file-system can't read an arbitrary content://
+ * URI directly (only file:// and its own directories), which is exactly what an
+ * Android "open with" intent hands us. So copy such a URI into the app cache
+ * first, read the local copy, then delete it. file:// URIs are read directly.
+ */
+async function readAsBase64(uri, name) {
+  if (uri.startsWith('content://')) {
+    const safe = (name || 'model').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const dest = `${FileSystem.cacheDirectory}open-${Date.now()}-${safe}`;
+    await FileSystem.copyAsync({ from: uri, to: dest });
+    try {
+      return await FileSystem.readAsStringAsync(dest, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+    } finally {
+      FileSystem.deleteAsync(dest, { idempotent: true }).catch(() => {});
+    }
+  }
+  return FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+}
+
 async function parseByExtension(ext, base64) {
   switch (ext) {
     case 'stl': {
@@ -144,9 +166,7 @@ async function parseByExtension(ext, base64) {
  * @returns {Promise<{ object: THREE.Object3D, ext: string }>}
  */
 export async function loadModel(file, color) {
-  const base64 = await FileSystem.readAsStringAsync(file.uri, {
-    encoding: FileSystem.EncodingType.Base64,
-  });
+  const base64 = await readAsBase64(file.uri, file.name);
 
   // Prefer the filename's extension; when it's missing or unknown (common for
   // files opened through an Android "open with" content:// URI), sniff the
