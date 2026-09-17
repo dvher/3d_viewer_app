@@ -22,6 +22,22 @@ const GITHUB_ISSUES_URL = `${GITHUB_URL}/issues/new`;
 let ID = 0;
 const nextId = () => `m${++ID}`;
 
+// Group a number's integer part with thousands separators (Hermes' Intl is
+// unreliable), e.g. 1234567 -> "1,234,567".
+function groupThousands(n) {
+  const [int, frac] = String(n).split('.');
+  const grouped = int.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return frac ? `${grouped}.${frac}` : grouped;
+}
+
+// Format a millimeter value adaptively: sub-millimeter volumes read better in
+// mm³, everyday parts in cm³.
+function formatVolume(mm3) {
+  const cm3 = mm3 / 1000;
+  if (cm3 >= 0.1) return `${groupThousands(cm3.toFixed(2))} cm³`;
+  return `${groupThousands(Math.round(mm3))} mm³`;
+}
+
 // Derive a display name (with extension when present) from an incoming file URI.
 function nameFromUri(uri) {
   try {
@@ -65,6 +81,8 @@ export default function ViewerScreen() {
   const [diffOn, setDiffOn] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [stats, setStats] = useState(null); // { name, size, volume, area, triangles } | null
+  const [caliper, setCaliper] = useState([]); // [{ point: Vector3, modelId, scale }] (0–2)
 
   const manager = managerRef.current;
 
@@ -72,6 +90,35 @@ export default function ViewerScreen() {
   const syncSelection = useCallback(() => {
     setSelectedIds([...managerRef.current.selectedIds]);
   }, []);
+
+  // ----- Caliper (interactive measure) --------------------------------------
+
+  const clearCaliper = useCallback(() => {
+    setCaliper([]);
+    managerRef.current.clearCaliper();
+  }, []);
+
+  // Plant a measurement point at a view-local touch. Two points make a
+  // measurement; a third tap starts a fresh one.
+  const placePoint = useCallback((localX, localY) => {
+    const hit = managerRef.current.pickSurface(localX, localY);
+    if (!hit) return;
+    setCaliper((prev) => {
+      const next = prev.length >= 2 ? [hit] : [...prev, hit];
+      managerRef.current.renderCaliper(next.map((p) => p.point));
+      return next;
+    });
+  }, []);
+
+  // Straight-line distance between the two points, in the file's native units
+  // (mm). World distance is divided by the model's normalization scale; only
+  // meaningful when both points sit on the same model.
+  const caliperDistance = useMemo(() => {
+    if (caliper.length < 2) return null;
+    const [a, b] = caliper;
+    if (a.modelId !== b.modelId) return { crossModel: true };
+    return { mm: a.point.distanceTo(b.point) / a.scale };
+  }, [caliper]);
 
   // Stop the render loop when the screen unmounts.
   useEffect(() => () => manager.dispose(), [manager]);
@@ -183,9 +230,23 @@ export default function ViewerScreen() {
       manager.removeModel(id);
       setModels((prev) => prev.filter((m) => m.id !== id));
       syncSelection();
+      setStats((s) => (s && s.id === id ? null : s));
+      if (caliper.some((p) => p.modelId === id)) clearCaliper();
       if (diffOn) setDiffOn(false);
     },
-    [manager, diffOn, syncSelection]
+    [manager, diffOn, syncSelection, caliper, clearCaliper]
+  );
+
+  // ----- Measurements (computed on demand, never at load time) ---------------
+
+  const showStats = useCallback(
+    (id) => {
+      const model = models.find((m) => m.id === id);
+      const s = manager.computeStats(id);
+      if (!model || !s) return;
+      setStats({ id, name: model.name, ...s });
+    },
+    [manager, models]
   );
 
   // ----- Diff selection (independent from the move-selection) ----------------
@@ -218,12 +279,20 @@ export default function ViewerScreen() {
     setDiffOn(next);
     setError(null);
     if (next) {
+      // Diff repositions models, so any active caliper measurement is now stale;
+      // also drop out of measure mode since it's unavailable while diffing.
+      clearCaliper();
+      if (mode === 'measure') {
+        setMode('orbit');
+        manager.setMode('orbit');
+        manager.setActiveAxis(null);
+      }
       manager.setDiff(true, diffSelected[0], diffSelected[1]);
       manager.frameAll();
     } else {
       manager.setDiff(false);
     }
-  }, [diffOn, canDiff, diffSelected, manager]);
+  }, [diffOn, canDiff, diffSelected, manager, mode, clearCaliper]);
 
   // ----- Mode / selection ---------------------------------------------------
 
@@ -233,8 +302,10 @@ export default function ViewerScreen() {
       manager.setMode(m);
       // Reflect the current axis lock on the gizmo when entering move mode.
       manager.setActiveAxis(m === 'move' && moveAxis !== 'free' ? moveAxis : null);
+      // Leaving measure mode drops the current measurement.
+      if (m !== 'measure') clearCaliper();
     },
-    [manager, moveAxis]
+    [manager, moveAxis, clearCaliper]
   );
 
   const selectAxis = useCallback(
@@ -257,7 +328,9 @@ export default function ViewerScreen() {
   const resetView = useCallback(() => {
     manager.frameAll();
     if (!diffOn) manager.resetPositions();
-  }, [manager, diffOn]);
+    // Positions may have changed under the markers; drop any measurement.
+    if (caliper.length) clearCaliper();
+  }, [manager, diffOn, caliper.length, clearCaliper]);
 
   // ----- Touch gestures -----------------------------------------------------
 
@@ -296,6 +369,8 @@ export default function ViewerScreen() {
           }
 
           // Long press (without moving) toggles this model in the selection.
+          // Disabled in measure mode, where a tap plants a caliper point.
+          if (mode === 'measure') return;
           g.longPressTimer = setTimeout(() => {
             if (g.moved) return;
             const id = m.pickModel(g.startLocalX, g.startLocalY);
@@ -379,14 +454,19 @@ export default function ViewerScreen() {
           const m = managerRef.current;
           clearTimeout(g.longPressTimer);
 
-          // A clean tap (no drag, no long-press) selects the tapped model, or
-          // clears the selection when tapping empty space. Tapping an axis handle
-          // is ignored so it doesn't wipe the selection.
+          // A clean tap (no drag, no long-press). In measure mode it plants a
+          // caliper point; otherwise it selects the tapped model, or clears the
+          // selection on empty space. Tapping an axis handle is ignored so it
+          // doesn't wipe the selection.
           if (!g.moved && !g.longPressFired && !g.axis) {
-            const id = m.pickModel(g.startLocalX, g.startLocalY);
-            if (id) m.setSelection([id]);
-            else m.clearSelection();
-            syncSelection();
+            if (mode === 'measure') {
+              placePoint(g.startLocalX, g.startLocalY);
+            } else {
+              const id = m.pickModel(g.startLocalX, g.startLocalY);
+              if (id) m.setSelection([id]);
+              else m.clearSelection();
+              syncSelection();
+            }
           }
 
           g.touches = 0;
@@ -405,7 +485,7 @@ export default function ViewerScreen() {
           g.longPressFired = false;
         },
       }),
-    [mode, moveAxis, syncSelection]
+    [mode, moveAxis, syncSelection, placePoint]
   );
 
   // ----- Render -------------------------------------------------------------
@@ -442,6 +522,8 @@ export default function ViewerScreen() {
               ? 'Diff mode · two models overlapped'
               : mode === 'move'
               ? 'Move · drag model or an axis handle · tap to select · long-press to multi-select'
+              : mode === 'measure'
+              ? 'Measure · tap two points on a model · drag to orbit'
               : 'Orbit · drag rotates · pinch zoom · tap to select · long-press to multi-select'}
           </Text>
         </View>
@@ -469,6 +551,9 @@ export default function ViewerScreen() {
                     </Text>
                   </TouchableOpacity>
                   <View style={styles.chipActions}>
+                    <TouchableOpacity onPress={() => showStats(m.id)}>
+                      <Text style={styles.infoBadge}>ⓘ</Text>
+                    </TouchableOpacity>
                     <TouchableOpacity onPress={() => toggleDiffSelect(m.id)}>
                       <Text style={[styles.diffBadge, m.diffSelected && styles.diffBadgeOn]}>
                         {m.diffSelected ? '◆' : '◇'}
@@ -496,9 +581,29 @@ export default function ViewerScreen() {
         </View>
       )}
 
+      {/* Caliper readout (Measure mode only) */}
+      {mode === 'measure' && !diffOn && hasModels && (
+        <View style={styles.caliperBar}>
+          <Text style={styles.caliperText}>
+            {caliperDistance
+              ? caliperDistance.crossModel
+                ? 'Points are on different models'
+                : `Distance  ${caliperDistance.mm.toFixed(2)} mm`
+              : caliper.length === 1
+              ? 'Tap the second point'
+              : 'Tap a point on the model'}
+          </Text>
+          {caliper.length > 0 && (
+            <TouchableOpacity style={styles.caliperClear} onPress={clearCaliper}>
+              <Text style={styles.caliperClearText}>Clear</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+
       {/* Toolbar */}
       <View style={styles.toolbar}>
-        <ToolButton label={loading ? '…' : '+ Import'} onPress={importFiles} primary disabled={loading} />
+        <ToolButton label={loading ? '…' : 'Import'} onPress={importFiles} primary disabled={loading} />
         <ToolButton
           label="Orbit"
           onPress={() => changeMode('orbit')}
@@ -509,6 +614,12 @@ export default function ViewerScreen() {
           label="Move"
           onPress={() => changeMode('move')}
           active={mode === 'move' && !diffOn}
+          disabled={diffOn || !hasModels}
+        />
+        <ToolButton
+          label="Measure"
+          onPress={() => changeMode('measure')}
+          active={mode === 'measure' && !diffOn}
           disabled={diffOn || !hasModels}
         />
         <ToolButton
@@ -526,6 +637,39 @@ export default function ViewerScreen() {
           <Text style={styles.loadingText}>Loading model…</Text>
         </View>
       )}
+
+      {/* Measurements panel (on-demand) */}
+      {stats && (
+        <View style={styles.statsBackdrop}>
+          <View style={styles.statsCard}>
+            <Text numberOfLines={1} style={styles.statsTitle}>
+              {stats.name}
+            </Text>
+            <StatRow
+              label="Dimensions"
+              value={`${stats.size.x.toFixed(1)} × ${stats.size.y.toFixed(1)} × ${stats.size.z.toFixed(1)} mm`}
+            />
+            <StatRow label="Volume" value={formatVolume(stats.volume)} strong />
+            <StatRow label="Surface area" value={`${groupThousands((stats.area / 100).toFixed(2))} cm²`} />
+            <StatRow label="Triangles" value={groupThousands(stats.triangles)} />
+            <Text style={styles.statsNote}>
+              Assumes the file is in millimeters (STL/3MF standard).
+            </Text>
+            <TouchableOpacity style={styles.statsClose} onPress={() => setStats(null)}>
+              <Text style={styles.statsCloseText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+    </View>
+  );
+}
+
+function StatRow({ label, value, strong }) {
+  return (
+    <View style={styles.statRow}>
+      <Text style={styles.statLabel}>{label}</Text>
+      <Text style={[styles.statValue, strong && styles.statValueStrong]}>{value}</Text>
     </View>
   );
 }
@@ -542,7 +686,9 @@ function ToolButton({ label, onPress, active, primary, disabled }) {
         disabled && styles.btnDisabled,
       ]}
     >
-      <Text style={[styles.btnText, active && styles.btnTextActive]}>{label}</Text>
+      <Text numberOfLines={1} style={[styles.btnText, active && styles.btnTextActive]}>
+        {label}
+      </Text>
     </TouchableOpacity>
   );
 }
@@ -656,13 +802,34 @@ const styles = StyleSheet.create({
   swatch: { width: 14, height: 14, borderRadius: 3, marginRight: 8 },
   chipName: { color: '#dfe6ed', fontSize: 13, flexShrink: 1 },
   chipActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 6 },
+  infoBadge: { color: '#6f7d8c', fontSize: 16, paddingHorizontal: 6 },
   diffBadge: { color: '#6f7d8c', fontSize: 16, paddingHorizontal: 6 },
   diffBadgeOn: { color: '#ffd24d' },
   removeBadge: { color: '#7a8794', fontSize: 14, paddingHorizontal: 6 },
+  caliperBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: '#161b21',
+    borderTopWidth: 1,
+    borderTopColor: '#20272f',
+  },
+  caliperText: { color: '#ffd24d', fontSize: 14, fontWeight: '600', flexShrink: 1 },
+  caliperClear: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: '#232b34',
+    borderWidth: 1,
+    borderColor: '#2a323c',
+  },
+  caliperClearText: { color: '#dfe6ed', fontSize: 12, fontWeight: '600' },
   toolbar: {
     flexDirection: 'row',
     padding: 10,
-    gap: 8,
+    gap: 6,
     backgroundColor: '#161b21',
     borderTopWidth: 1,
     borderTopColor: '#20272f',
@@ -671,6 +838,7 @@ const styles = StyleSheet.create({
   btn: {
     flex: 1,
     paddingVertical: 12,
+    paddingHorizontal: 2,
     borderRadius: 10,
     backgroundColor: '#232b34',
     alignItems: 'center',
@@ -679,8 +847,45 @@ const styles = StyleSheet.create({
   btnPrimary: { backgroundColor: '#2d6cdf' },
   btnActive: { backgroundColor: '#4dd2ff' },
   btnDisabled: { opacity: 0.4 },
-  btnText: { color: '#dfe6ed', fontSize: 13, fontWeight: '600' },
+  btnText: { color: '#dfe6ed', fontSize: 12, fontWeight: '600' },
   btnTextActive: { color: '#0b1015' },
   loading: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
   loadingText: { color: '#8a97a6', marginTop: 10 },
+  statsBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(8,10,13,0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  statsCard: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: '#1a2028',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#2a323c',
+    padding: 18,
+  },
+  statsTitle: { color: '#e8edf2', fontSize: 16, fontWeight: '700', marginBottom: 12 },
+  statRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 7,
+    borderTopWidth: 1,
+    borderTopColor: '#232b34',
+  },
+  statLabel: { color: '#8a97a6', fontSize: 13 },
+  statValue: { color: '#dfe6ed', fontSize: 14, fontWeight: '600', marginLeft: 12 },
+  statValueStrong: { color: '#4dd2ff', fontSize: 16 },
+  statsNote: { color: '#6f7d8c', fontSize: 11, marginTop: 12, fontStyle: 'italic' },
+  statsClose: {
+    marginTop: 16,
+    backgroundColor: '#2d6cdf',
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  statsCloseText: { color: '#fff', fontSize: 14, fontWeight: '600' },
 });

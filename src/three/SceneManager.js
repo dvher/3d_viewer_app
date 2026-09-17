@@ -52,6 +52,13 @@ export default class SceneManager {
     this.gizmo = null;
     this.axisMaterials = {}; // 'x'|'y'|'z' -> gizmo handle material
 
+    // Caliper (interactive measure) overlay: point markers + a connecting line,
+    // drawn on top of everything so a measurement stays readable through solids.
+    this.caliperGroup = null;
+    this.caliperMarkers = [];
+    this.caliperLine = null;
+    this.caliperSphereGeo = null;
+
     // On-demand rendering: the loop only draws while renderFrames > 0. Any change
     // calls invalidate(). We render a couple of frames per change so double-
     // buffered surfaces update both buffers. Set continuous=true to fall back to
@@ -103,6 +110,12 @@ export default class SceneManager {
     this.gizmo.visible = false;
     scene.add(this.gizmo);
 
+    // Reusable unit sphere for caliper markers (scaled per-frame to stay a
+    // constant on-screen size regardless of zoom).
+    this.caliperSphereGeo = new THREE.SphereGeometry(1, 16, 12);
+    this.caliperGroup = new THREE.Group();
+    scene.add(this.caliperGroup);
+
     this.updateCamera();
     this.start();
   }
@@ -113,6 +126,7 @@ export default class SceneManager {
       if (!this.continuous && this.renderFrames <= 0) return;
       this.renderFrames--;
       this.updateGizmo();
+      this.updateCaliper();
       this.renderer.render(this.scene, this.camera);
       this.gl.endFrameEXP();
     };
@@ -124,6 +138,8 @@ export default class SceneManager {
     this.raf = null;
     this.models.forEach(({ group }) => this.disposeObject(group));
     this.models.clear();
+    this.clearCaliper();
+    this.caliperSphereGeo?.dispose();
   }
 
   disposeObject(object) {
@@ -189,6 +205,86 @@ export default class SceneManager {
   setMode(mode) {
     this.mode = mode;
     this.invalidate();
+  }
+
+  /**
+   * Compute geometric measurements for a model, on demand (nothing is cached at
+   * load time, so importing stays fast). Everything is evaluated in the model's
+   * group-local frame — that cancels out the artificial normalization scale and
+   * any move/rotate the user applied, so results are in the file's native units
+   * (millimeters for STL/3MF) and independent of the current pose.
+   *
+   * @returns {{ volume:number, area:number, triangles:number,
+   *             size:{x:number,y:number,z:number} } | null}
+   */
+  computeStats(id) {
+    const entry = this.models.get(id);
+    if (!entry) return null;
+    const group = entry.group;
+    group.updateMatrixWorld(true);
+
+    // Transform that maps a mesh's world matrix back into group-local space.
+    const invGroup = new THREE.Matrix4().copy(group.matrixWorld).invert();
+    const rel = new THREE.Matrix4();
+
+    const v0 = new THREE.Vector3();
+    const v1 = new THREE.Vector3();
+    const v2 = new THREE.Vector3();
+    const e1 = new THREE.Vector3();
+    const e2 = new THREE.Vector3();
+    const cross = new THREE.Vector3();
+    const min = new THREE.Vector3(Infinity, Infinity, Infinity);
+    const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+
+    let volume = 0; // 6× the signed volume until the final divide
+    let area = 0; //   2× the surface area until the final divide
+    let triangles = 0;
+
+    group.traverse((child) => {
+      if (!child.isMesh || !child.geometry) return;
+      const pos = child.geometry.attributes.position;
+      if (!pos) return;
+      rel.multiplyMatrices(invGroup, child.matrixWorld);
+      const index = child.geometry.index;
+      const triCount = (index ? index.count : pos.count) / 3;
+
+      const read = (vertIndex, target) =>
+        target
+          .set(pos.getX(vertIndex), pos.getY(vertIndex), pos.getZ(vertIndex))
+          .applyMatrix4(rel);
+
+      for (let t = 0; t < triCount; t++) {
+        const base = t * 3;
+        const iA = index ? index.getX(base) : base;
+        const iB = index ? index.getX(base + 1) : base + 1;
+        const iC = index ? index.getX(base + 2) : base + 2;
+        read(iA, v0);
+        read(iB, v1);
+        read(iC, v2);
+
+        // Signed volume of the tetrahedron (origin, v0, v1, v2): v0 · (v1 × v2).
+        volume += v0.dot(cross.copy(v1).cross(v2));
+        // Triangle area: ½ |(v1 - v0) × (v2 - v0)|.
+        e1.copy(v1).sub(v0);
+        e2.copy(v2).sub(v0);
+        area += cross.copy(e1).cross(e2).length();
+
+        min.min(v0).min(v1).min(v2);
+        max.max(v0).max(v1).max(v2);
+        triangles++;
+      }
+    });
+
+    if (triangles === 0) {
+      return { volume: 0, area: 0, triangles: 0, size: { x: 0, y: 0, z: 0 } };
+    }
+
+    return {
+      volume: Math.abs(volume) / 6,
+      area: area / 2,
+      triangles,
+      size: { x: max.x - min.x, y: max.y - min.y, z: max.z - min.z },
+    };
   }
 
   // ----- Selection ----------------------------------------------------------
@@ -358,6 +454,40 @@ export default class SceneManager {
   }
 
   /**
+   * Raycast from a view-local touch point to the nearest model surface. Returns
+   * the exact hit point (world space), the model hit, and that model's uniform
+   * normalization scale — so callers can convert a world-space distance between
+   * two hits back to the file's native units (worldDistance / scale). Null when
+   * nothing was hit.
+   */
+  pickSurface(localX, localY) {
+    this.raycaster.setFromCamera(this.toNDC(localX, localY), this.camera);
+    const groups = [];
+    this.models.forEach((e) => {
+      if (e.group.visible) groups.push(e.group);
+    });
+    const hits = this.raycaster.intersectObjects(groups, true);
+    if (!hits.length) return null;
+
+    const hit = hits[0];
+    let o = hit.object;
+    let modelId = null;
+    while (o) {
+      if (o.userData && o.userData.modelId) {
+        modelId = o.userData.modelId;
+        break;
+      }
+      o = o.parent;
+    }
+    const entry = modelId ? this.models.get(modelId) : null;
+    return {
+      point: hit.point.clone(),
+      modelId,
+      scale: entry ? entry.group.scale.x : 1,
+    };
+  }
+
+  /**
    * Raycast against the axis gizmo and return 'x' | 'y' | 'z' if a handle was
    * hit, otherwise null.
    */
@@ -433,6 +563,64 @@ export default class SceneManager {
       const mat = this.axisMaterials[name];
       if (mat) mat.opacity = !this.activeAxis || this.activeAxis === name ? 0.95 : 0.18;
     }
+  }
+
+  // ----- Caliper (interactive measure) --------------------------------------
+
+  /**
+   * Draw markers at each world-space point and, once there are two, a line
+   * between them. Replaces any previous caliper drawing. Pass [] to clear.
+   */
+  renderCaliper(points) {
+    if (!this.caliperGroup) return;
+
+    // Tear down the previous drawing (markers share a geometry; only materials
+    // and the line geometry need disposing).
+    this.caliperMarkers.forEach((m) => m.material.dispose());
+    this.caliperMarkers = [];
+    if (this.caliperLine) {
+      this.caliperLine.geometry.dispose();
+      this.caliperLine.material.dispose();
+      this.caliperLine = null;
+    }
+    this.caliperGroup.clear();
+
+    const COLOR = 0xffd24d;
+    for (const p of points) {
+      const marker = new THREE.Mesh(
+        this.caliperSphereGeo,
+        new THREE.MeshBasicMaterial({ color: COLOR, depthTest: false, transparent: true })
+      );
+      marker.position.copy(p);
+      marker.renderOrder = 998; // draw over models so the point is never hidden
+      this.caliperGroup.add(marker);
+      this.caliperMarkers.push(marker);
+    }
+
+    if (points.length === 2) {
+      const geometry = new THREE.BufferGeometry().setFromPoints([points[0], points[1]]);
+      const line = new THREE.Line(
+        geometry,
+        new THREE.LineBasicMaterial({ color: COLOR, depthTest: false, transparent: true })
+      );
+      line.renderOrder = 998;
+      this.caliperGroup.add(line);
+      this.caliperLine = line;
+    }
+
+    this.updateCaliper();
+    this.invalidate();
+  }
+
+  clearCaliper() {
+    this.renderCaliper([]);
+  }
+
+  updateCaliper() {
+    if (!this.caliperMarkers.length) return;
+    // Keep markers a roughly constant on-screen size as the user zooms.
+    const s = this.spherical.radius * 0.012;
+    for (const m of this.caliperMarkers) m.scale.setScalar(s);
   }
 
   // ----- Camera / object manipulation ---------------------------------------
