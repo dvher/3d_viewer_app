@@ -18,6 +18,45 @@ function extensionOf(name = '') {
   return parts.length > 1 ? parts.pop().toLowerCase() : '';
 }
 
+// Read up to `max` bytes as a loose ASCII string for text-format sniffing.
+function asciiPrefix(bytes, max = 512) {
+  let s = '';
+  const n = Math.min(bytes.length, max);
+  for (let i = 0; i < n; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+}
+
+/**
+ * Guess the model format from its raw bytes. Used when a file arrives via an
+ * Android "open with" intent, where the content:// URI often carries no usable
+ * filename/extension. Returns a SUPPORTED_EXTENSIONS value, or null if unknown.
+ */
+function sniffExtension(base64) {
+  const bytes = new Uint8Array(base64ToArrayBuffer(base64));
+  if (bytes.length < 4) return null;
+
+  // 3MF is a ZIP archive ("PK\x03\x04").
+  if (bytes[0] === 0x50 && bytes[1] === 0x4b) return '3mf';
+  // Binary glTF magic "glTF".
+  if (bytes[0] === 0x67 && bytes[1] === 0x6c && bytes[2] === 0x54 && bytes[3] === 0x46) return 'glb';
+  // JSON glTF starts with '{'.
+  if (bytes[0] === 0x7b) return 'gltf';
+
+  const head = asciiPrefix(bytes);
+  // ASCII STL begins with the "solid" keyword.
+  if (/^\s*solid\b/i.test(head)) return 'stl';
+  // Binary STL: 80-byte header + uint32 triangle count, then 50 bytes/triangle.
+  if (bytes.length >= 84) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const triCount = view.getUint32(80, true);
+    if (bytes.length === 84 + triCount * 50) return 'stl';
+  }
+  // OBJ is a text file of vertex/face directives.
+  if (/^\s*(#|v\s|vn\s|vt\s|f\s|o\s|g\s|s\s|mtllib|usemtl)/m.test(head)) return 'obj';
+
+  return null;
+}
+
 /**
  * Prepare an object's meshes for the scene.
  *
@@ -105,14 +144,20 @@ async function parseByExtension(ext, base64) {
  * @returns {Promise<{ object: THREE.Object3D, ext: string }>}
  */
 export async function loadModel(file, color) {
-  const ext = extensionOf(file.name);
-  if (!SUPPORTED_EXTENSIONS.includes(ext)) {
-    throw new Error(`Unsupported file type: .${ext || '?'}`);
-  }
-
   const base64 = await FileSystem.readAsStringAsync(file.uri, {
     encoding: FileSystem.EncodingType.Base64,
   });
+
+  // Prefer the filename's extension; when it's missing or unknown (common for
+  // files opened through an Android "open with" content:// URI), sniff the
+  // format from the raw bytes.
+  let ext = extensionOf(file.name);
+  if (!SUPPORTED_EXTENSIONS.includes(ext)) {
+    ext = sniffExtension(base64);
+  }
+  if (!SUPPORTED_EXTENSIONS.includes(ext)) {
+    throw new Error(`Unsupported or unrecognized 3D file`);
+  }
 
   const raw = await parseByExtension(ext, base64);
   // GLB/glTF keep their real materials; STL/OBJ/3MF get a lit material (with

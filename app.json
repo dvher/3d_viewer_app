@@ -16,7 +16,46 @@
       "bundleIdentifier": "com.diego.project3dviewer"
     },
     "android": {
-      "package": "com.diego.project3dviewer"
+      "package": "com.diego.project3dviewer",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "category": ["DEFAULT", "BROWSABLE"],
+          "data": [
+            { "mimeType": "application/octet-stream" },
+            { "mimeType": "application/sla" },
+            { "mimeType": "application/vnd.ms-pki.stl" },
+            { "mimeType": "model/stl" },
+            { "mimeType": "model/x.stl-binary" },
+            { "mimeType": "model/x.stl-ascii" },
+            { "mimeType": "model/3mf" },
+            { "mimeType": "application/vnd.ms-package.3dmanufacturing-3dmodel+xml" },
+            { "mimeType": "model/gltf-binary" },
+            { "mimeType": "model/gltf+json" },
+            { "mimeType": "model/obj" }
+          ]
+        },
+        {
+          "action": "VIEW",
+          "category": ["DEFAULT", "BROWSABLE"],
+          "data": [
+            { "scheme": "content", "host": "*", "pathPattern": ".*\\.stl" },
+            { "scheme": "content", "host": "*", "pathPattern": ".*\\..*\\.stl" },
+            { "scheme": "content", "host": "*", "pathPattern": ".*\\.3mf" },
+            { "scheme": "content", "host": "*", "pathPattern": ".*\\..*\\.3mf" },
+            { "scheme": "content", "host": "*", "pathPattern": ".*\\.glb" },
+            { "scheme": "content", "host": "*", "pathPattern": ".*\\.gltf" },
+            { "scheme": "content", "host": "*", "pathPattern": ".*\\.obj" },
+            { "scheme": "file", "host": "*", "pathPattern": ".*\\.stl" },
+            { "scheme": "file", "host": "*", "pathPattern": ".*\\..*\\.stl" },
+            { "scheme": "file", "host": "*", "pathPattern": ".*\\.3mf" },
+            { "scheme": "file", "host": "*", "pathPattern": ".*\\..*\\.3mf" },
+            { "scheme": "file", "host": "*", "pathPattern": ".*\\.glb" },
+            { "scheme": "file", "host": "*", "pathPattern": ".*\\.gltf" },
+            { "scheme": "file", "host": "*", "pathPattern": ".*\\.obj" }
+          ]
+        }
+      ]
     },
     "web": {
       "bundler": "metro"

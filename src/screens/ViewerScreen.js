@@ -7,6 +7,7 @@ import {
   ActivityIndicator,
   PanResponder,
   StyleSheet,
+  Linking,
 } from 'react-native';
 import { GLView } from 'expo-gl';
 import * as DocumentPicker from 'expo-document-picker';
@@ -14,8 +15,24 @@ import * as DocumentPicker from 'expo-document-picker';
 import SceneManager, { MODEL_COLORS } from '../three/SceneManager';
 import { loadModel, SUPPORTED_EXTENSIONS } from '../three/loadModel';
 
+// GitHub repository — used for the "report a bug" link.
+const GITHUB_URL = 'https://github.com/dvher/3d_viewer_app';
+const GITHUB_ISSUES_URL = `${GITHUB_URL}/issues/new`;
+
 let ID = 0;
 const nextId = () => `m${++ID}`;
+
+// Derive a display name (with extension when present) from an incoming file URI.
+function nameFromUri(uri) {
+  try {
+    const path = decodeURIComponent(uri.split('?')[0].split('#')[0]);
+    const last = path.split('/').pop();
+    if (last && last.includes('.')) return last;
+  } catch {
+    // fall through to the default below
+  }
+  return 'Shared model';
+}
 
 // A single-finger drag under this many dp still counts as a tap.
 const TAP_MOVE_THRESHOLD = 8;
@@ -79,6 +96,50 @@ export default function ViewerScreen() {
 
   // ----- File import --------------------------------------------------------
 
+  // Next color to hand out; a ref so it survives re-renders and stays correct
+  // regardless of which entry point (picker or "open with" intent) adds a model.
+  const colorIndexRef = useRef(0);
+
+  // Load a batch of { uri, name } assets into the scene. `validateExt` filters
+  // by filename extension up front (used by the picker); intent-opened files
+  // skip it because their content:// URI may not expose an extension — the
+  // loader sniffs the format from the bytes instead.
+  const addAssets = useCallback(
+    async (assets, { validateExt = true } = {}) => {
+      if (!assets.length) return;
+      setLoading(true);
+      const added = [];
+      try {
+        for (const asset of assets) {
+          const name = asset.name || nameFromUri(asset.uri);
+          if (validateExt) {
+            const ext = (name.split('.').pop() || '').toLowerCase();
+            if (!SUPPORTED_EXTENSIONS.includes(ext)) {
+              setError(`Skipped "${name}" — unsupported type .${ext}`);
+              continue;
+            }
+          }
+          const id = nextId();
+          const color = MODEL_COLORS[colorIndexRef.current++ % MODEL_COLORS.length];
+          try {
+            const { object } = await loadModel({ uri: asset.uri, name }, color);
+            manager.addModel(id, object, color);
+            added.push({ id, name, color, diffSelected: false });
+          } catch (err) {
+            setError(`Failed to load "${name}": ${err.message}`);
+          }
+        }
+        if (added.length) {
+          setModels((prev) => [...prev, ...added]);
+          syncSelection();
+        }
+      } finally {
+        setLoading(false);
+      }
+    },
+    [manager, syncSelection]
+  );
+
   const importFiles = useCallback(async () => {
     setError(null);
     try {
@@ -88,38 +149,34 @@ export default function ViewerScreen() {
         type: '*/*', // many devices don't map .stl/.3mf MIME types; filter by name below
       });
       if (result.canceled) return;
-
-      setLoading(true);
-      const picked = result.assets ?? [];
-      const added = [];
-
-      for (const asset of picked) {
-        const ext = (asset.name.split('.').pop() || '').toLowerCase();
-        if (!SUPPORTED_EXTENSIONS.includes(ext)) {
-          setError(`Skipped "${asset.name}" — unsupported type .${ext}`);
-          continue;
-        }
-        const id = nextId();
-        const color = MODEL_COLORS[(models.length + added.length) % MODEL_COLORS.length];
-        try {
-          const { object } = await loadModel(asset, color);
-          manager.addModel(id, object, color);
-          added.push({ id, name: asset.name, color, diffSelected: false });
-        } catch (err) {
-          setError(`Failed to load "${asset.name}": ${err.message}`);
-        }
-      }
-
-      if (added.length) {
-        setModels((prev) => [...prev, ...added]);
-        syncSelection();
-      }
+      await addAssets(result.assets ?? []);
     } catch (err) {
       setError(err.message ?? String(err));
-    } finally {
-      setLoading(false);
     }
-  }, [manager, models.length, syncSelection]);
+  }, [addAssets]);
+
+  // Handle files opened via an Android "open with" intent (content://) as well
+  // as any custom-scheme deep link. Runs once for the URL that launched the app
+  // and again for every URL delivered while it's already running.
+  useEffect(() => {
+    const handleUrl = (url) => {
+      if (!url) return;
+      if (url.startsWith('file://') || url.startsWith('content://')) {
+        setError(null);
+        addAssets([{ uri: url, name: nameFromUri(url) }], { validateExt: false });
+      }
+    };
+
+    Linking.getInitialURL().then(handleUrl).catch(() => {});
+    const sub = Linking.addEventListener('url', (e) => handleUrl(e?.url));
+    return () => sub.remove();
+  }, [addAssets]);
+
+  const reportBug = useCallback(() => {
+    Linking.openURL(GITHUB_ISSUES_URL).catch(() =>
+      setError('Could not open the browser to report a bug.')
+    );
+  }, []);
 
   const removeModel = useCallback(
     (id) => {
@@ -362,13 +419,21 @@ export default function ViewerScreen() {
         <GLView style={StyleSheet.absoluteFill} onContextCreate={onContextCreate} />
 
         {!hasModels && (
-          <View pointerEvents="none" style={styles.emptyOverlay}>
-            <Text style={styles.emptyTitle}>3D Viewer</Text>
-            <Text style={styles.emptyText}>
+          <View pointerEvents="box-none" style={styles.emptyOverlay}>
+            <Text pointerEvents="none" style={styles.emptyTitle}>3D Viewer</Text>
+            <Text pointerEvents="none" style={styles.emptyText}>
               Import STL, 3MF, GLB or OBJ files to get started.
             </Text>
+            <TouchableOpacity style={styles.emptyBugLink} onPress={reportBug}>
+              <Text style={styles.emptyBugText}>Found a bug? Report it on GitHub ↗</Text>
+            </TouchableOpacity>
           </View>
         )}
+
+        {/* Always-reachable bug-report link */}
+        <TouchableOpacity style={styles.bugCorner} onPress={reportBug} hitSlop={10}>
+          <Text style={styles.bugCornerText}>⚑ Bug</Text>
+        </TouchableOpacity>
 
         {/* Header hint */}
         <View pointerEvents="none" style={styles.header}>
@@ -524,6 +589,18 @@ const styles = StyleSheet.create({
   emptyOverlay: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
   emptyTitle: { color: '#e8edf2', fontSize: 28, fontWeight: '700', marginBottom: 8 },
   emptyText: { color: '#8a97a6', fontSize: 14, textAlign: 'center', paddingHorizontal: 40 },
+  emptyBugLink: { marginTop: 22, paddingHorizontal: 14, paddingVertical: 8 },
+  emptyBugText: { color: '#4dd2ff', fontSize: 13, fontWeight: '600' },
+  bugCorner: {
+    position: 'absolute',
+    top: 44,
+    right: 12,
+    backgroundColor: 'rgba(16,20,24,0.6)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  bugCornerText: { color: '#8a97a6', fontSize: 12, fontWeight: '600' },
   toast: {
     position: 'absolute',
     top: 76,
