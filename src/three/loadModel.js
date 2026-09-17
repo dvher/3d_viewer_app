@@ -1,11 +1,11 @@
 import * as FileSystem from 'expo-file-system';
 import * as THREE from 'three';
-import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 import { base64ToArrayBuffer, base64ToUtf8 } from './base64';
 import { parse3MF } from './parse3mf';
+import { parseSTL } from './parseStl';
 
 export const SUPPORTED_EXTENSIONS = ['stl', '3mf', 'glb', 'gltf', 'obj'];
 
@@ -135,8 +135,7 @@ async function readAsBase64(uri, name) {
 async function parseByExtension(ext, base64) {
   switch (ext) {
     case 'stl': {
-      const geometry = new STLLoader().parse(base64ToArrayBuffer(base64));
-      return new THREE.Mesh(geometry);
+      return new THREE.Mesh(parseSTL(base64ToArrayBuffer(base64)));
     }
     case 'obj': {
       return new OBJLoader().parse(base64ToUtf8(base64));
